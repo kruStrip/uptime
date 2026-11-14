@@ -1,0 +1,154 @@
+name: Uptime
+
+# Внешняя проверка сайтов раз в 5 минут: страницы открывает GitHub, а не сервер,
+# поэтому видно ровно то, что видит посетитель (14.11.2026 nginx залип так, что
+# снаружи не было даже TLS-ответа, а изнутри сервера всё отвечало 200).
+#
+# Репозиторий публичный намеренно: в публичных репозиториях минуты Actions не
+# тратятся, а проверка раз в 5 минут — это ~8600 запусков в месяц.
+#
+# Авария: один issue с меткой uptime (пока он открыт, повторов нет) и сообщение
+# в Telegram. Восстановление: issue закрывается и в Telegram уходит «снова работает».
+#
+# Секреты репозитория:
+#   TELEGRAM_BOT_TOKEN — токен бота (BotFather)
+#   TELEGRAM_CHAT_ID   — ваш числовой id в Telegram (@userinfobot)
+# Без них проверка работает, но алерты уходят только в issue.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Проверить аварийный сценарий (создать тестовый issue)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Проверить страницы
+        id: probe
+        run: |
+          set -uo pipefail
+
+          sites=(
+            "https://kotelnikova-ek.ru/|Екатерина Котельникова"
+            "https://alfa.kotelnikova-ek.ru/|Альфа-Бунк"
+            "https://delez.kotelnikova-ek.ru/|Delёz"
+            "https://finformy.ru/|ФинФормы"
+          )
+
+          failed=0
+          report="$RUNNER_TEMP/report.md"
+          printf '| Сайт | Код | TLS, с | Всего, с | Что не так |\n|---|---|---|---|---|\n' > "$report"
+
+          for item in "${sites[@]}"; do
+            url="${item%%|*}"
+            marker="${item##*|}"
+            body="$RUNNER_TEMP/body.html"
+            : > "$body"
+
+            if out=$(curl -sS --max-time 20 --connect-timeout 10 -o "$body" \
+                       -w '%{http_code} %{time_appconnect} %{time_total}' "$url" 2>&1); then
+              read -r code tls total <<< "$out"
+              err=""
+            else
+              code=000 tls="—" total="—"
+              err="нет соединения"
+            fi
+
+            if [ "$code" != "200" ] && [ "$err" = "" ]; then
+              err="код $code"
+            fi
+            if [ "$err" = "" ] && ! grep -qF -- "$marker" "$body"; then
+              err="нет текста «$marker»"
+            fi
+
+            if [ -n "$err" ]; then
+              failed=1
+              printf '| %s | %s | %s | %s | %s |\n' "$url" "$code" "$tls" "$total" "$err" >> "$report"
+            else
+              printf '| %s | %s | %s | %s | ok |\n' "$url" "$code" "$tls" "$total" >> "$report"
+            fi
+          done
+
+          if [ "${INPUT_TEST:-false}" = "true" ]; then
+            failed=1
+            echo "| — | — | — | — | тест аварийного сценария |" >> "$report"
+          fi
+
+          {
+            echo "### Проверка сайтов"
+            echo
+            cat "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          exit 0
+        env:
+          INPUT_TEST: ${{ inputs.test }}
+
+      - name: Сообщить об аварии
+        if: steps.probe.outputs.failed == '1'
+        run: |
+          set -uo pipefail
+          report=$(cat "$RUNNER_TEMP/report.md")
+
+          # Один открытый issue на инцидент: он же гасит повторы каждые 5 минут
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label uptime \
+                   --state open --json number --jq 'length')
+          if [ "$open" = "0" ]; then
+            gh label create uptime --repo "$GITHUB_REPOSITORY" \
+              --color B60205 --description "Сайт не отвечает (монитор)" --force >/dev/null 2>&1 || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --label uptime \
+              --assignee "$GITHUB_REPOSITORY_OWNER" \
+              --title "Сайт не отвечает: $(date -u '+%d.%m.%Y %H:%M UTC')" \
+              --body "$(printf 'Монитор не смог открыть страницы.\n\n%s\n\nЛог: %s/%s/actions/runs/%s' \
+                        "$report" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+
+            if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+              curl -sS --max-time 10 -o /dev/null \
+                "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                -d chat_id="${TG_CHAT}" -d parse_mode=HTML \
+                --data-urlencode text="$(printf '<b>Сайт не отвечает</b>\n%s\n\n%s' \
+                  "$(date -u '+%d.%m %H:%M UTC')" "$report")"
+            fi
+          else
+            echo "Инцидент уже открыт — повторно не пишем."
+          fi
+
+      - name: Сообщить о восстановлении
+        if: steps.probe.outputs.failed == '0'
+        run: |
+          set -uo pipefail
+          issues=$(gh issue list --repo "$GITHUB_REPOSITORY" --label uptime \
+                     --state open --json number --jq '.[].number')
+          [ -n "$issues" ] || exit 0
+
+          for n in $issues; do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
+              --comment "Все страницы снова отвечают ($(date -u '+%d.%m %H:%M UTC'))."
+          done
+
+          if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+            curl -sS --max-time 10 -o /dev/null \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" -d parse_mode=HTML \
+              --data-urlencode text="<b>Сайт снова работает</b> ($(date -u '+%d.%m %H:%M UTC'))"
+          fi
